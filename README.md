@@ -2,6 +2,8 @@
 
 A daemon-driven AI assistant with a clean client/server architecture.
 
+> **Disclaimer:** This is a fork of the original [Exocortex](https://github.com/Yeyito777/Exocortex) repo by [Yeyito777](https://github.com/Yeyito777). This fork adds fixes for the Windows port; all original credit goes to Yeyito777.
+
 ---
 
 ## MESSAGE FOR HUMANS:
