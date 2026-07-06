@@ -1,0 +1,8 @@
+{
+  "name": "exocortex",
+  "private": true,
+  "workspaces": ["shared", "daemon", "tui"],
+  "scripts": {
+    "typecheck": "bunx tsc --noEmit -p shared && bunx tsc --noEmit -p daemon && bunx tsc --noEmit -p tui"
+  }
+}

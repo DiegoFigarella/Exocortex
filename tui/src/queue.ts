@@ -1,0 +1,309 @@
+/**
+ * Message queue prompt — modal overlay for queuing messages during streaming.
+ *
+ * When the user submits a message while the AI is still streaming,
+ * a modal appears letting them choose when to deliver it:
+ * - "message end": sent after the current stream ends
+ * - "next turn": injected between tool-use rounds if possible,
+ *   otherwise sent after the stream ends
+ *
+ * j/k and arrow keys toggle the selection. Enter confirms, Escape cancels.
+ *
+ * The actual queue lives in the daemon — the TUI sends a queue_message
+ * command and keeps a local shadow copy for display (dimmed bubbles).
+ */
+
+import type { KeyEvent } from "./input";
+import type { ImageAttachment } from "./messages";
+import type { RenderState, QueueTiming, QueueWaitTarget, QueuedMessage } from "./state";
+import { expandMacros } from "./macros";
+import { isStreaming } from "./state";
+import { folderDescendantConversations } from "./sidebar/folders";
+
+export const GLOBAL_IDLE_QUEUE_LABEL = "queued: global idle";
+
+export function isGlobalIdleQueuedMessage(message: QueuedMessage): boolean {
+  return message.source === "global-idle";
+}
+
+export function isNewConversationQueuedMessage(message: QueuedMessage): boolean {
+  return isGlobalIdleQueuedMessage(message) && message.target === "new-conversation";
+}
+
+export type GlobalIdleQueueOptions = Pick<QueuedMessage, "target" | "provider" | "model" | "effort" | "fastMode" | "folderId" | "waitTarget">;
+
+export function queueWaitTargetOf(message: QueuedMessage): QueueWaitTarget {
+  return message.waitTarget ?? { type: "global" };
+}
+
+export function queueTimingLabel(message: QueuedMessage): string {
+  if (isGlobalIdleQueuedMessage(message)) {
+    const waitTarget = queueWaitTargetOf(message);
+    if (waitTarget.type === "conversation") return `queued: after ${waitTarget.label}`;
+    if (waitTarget.type === "folder") return `queued: after folder ${waitTarget.label}`;
+    return GLOBAL_IDLE_QUEUE_LABEL;
+  }
+  return message.timing === "next-turn" ? "queued: next turn" : "queued: message end";
+}
+
+export type QueueWaitStatus = "ready" | "waiting" | "missing-target";
+
+export function enqueueGlobalIdleMessage(
+  state: RenderState,
+  convId: string,
+  text: string,
+  images?: ImageAttachment[],
+  options: GlobalIdleQueueOptions = {},
+): QueuedMessage {
+  const queued: QueuedMessage = {
+    convId,
+    text,
+    timing: "message-end",
+    source: "global-idle",
+    ...(options.target ? { target: options.target } : {}),
+    ...(options.provider ? { provider: options.provider } : {}),
+    ...(options.model ? { model: options.model } : {}),
+    ...(options.effort ? { effort: options.effort } : {}),
+    ...(typeof options.fastMode === "boolean" ? { fastMode: options.fastMode } : {}),
+    ...("folderId" in options ? { folderId: options.folderId ?? null } : {}),
+    ...(options.waitTarget && options.waitTarget.type !== "global" ? { waitTarget: options.waitTarget } : {}),
+    ...(images?.length ? { images } : {}),
+  };
+  state.queuedMessages.push(queued);
+  return queued;
+}
+
+function isConversationKnown(state: RenderState, convId: string): boolean {
+  return convId === state.convId || state.sidebar.conversations.some(conversation => conversation.id === convId);
+}
+
+function isConversationStreamingInState(state: RenderState, convId: string): boolean {
+  if (convId === state.convId) return isStreaming(state);
+  return state.sidebar.conversations.some(conversation => conversation.id === convId && conversation.streaming);
+}
+
+function hasAnyTuiConversationStreaming(state: RenderState): boolean {
+  return isStreaming(state) || state.sidebar.conversations.some(conversation => conversation.streaming);
+}
+
+export function queueWaitStatus(state: RenderState, waitTarget: QueueWaitTarget): QueueWaitStatus {
+  if (waitTarget.type === "global") {
+    if (hasAnyTuiConversationStreaming(state)) return "waiting";
+    if (hasDaemonQueuedMessageShadows(state)) return "waiting";
+    return "ready";
+  }
+
+  if (waitTarget.type === "conversation") {
+    if (!isConversationKnown(state, waitTarget.convId)) return "missing-target";
+    if (isConversationStreamingInState(state, waitTarget.convId)) return "waiting";
+    if (hasDaemonQueuedMessageShadowsForConversation(state, waitTarget.convId)) return "waiting";
+    return "ready";
+  }
+
+  const folder = state.sidebar.folders.find(candidate => candidate.id === waitTarget.folderId);
+  if (!folder) return "missing-target";
+  for (const conversation of folderDescendantConversations(state.sidebar, waitTarget.folderId)) {
+    if (isConversationStreamingInState(state, conversation.id)) return "waiting";
+    if (hasDaemonQueuedMessageShadowsForConversation(state, conversation.id)) return "waiting";
+  }
+  return "ready";
+}
+
+export function queuedMessageWaitStatus(state: RenderState, message: QueuedMessage): QueueWaitStatus {
+  return queueWaitStatus(state, queueWaitTargetOf(message));
+}
+
+export function peekGlobalIdleQueuedMessage(state: RenderState): QueuedMessage | null {
+  return state.queuedMessages.find(isGlobalIdleQueuedMessage) ?? null;
+}
+
+export function hasGlobalIdleQueuedMessages(state: RenderState): boolean {
+  return state.queuedMessages.some(isGlobalIdleQueuedMessage);
+}
+
+export function hasDaemonQueuedMessageShadows(state: RenderState): boolean {
+  return state.queuedMessages.some(qm => !isGlobalIdleQueuedMessage(qm));
+}
+
+export function hasDaemonQueuedMessageShadowsForConversation(state: RenderState, convId: string): boolean {
+  return state.queuedMessages.some(qm => !isGlobalIdleQueuedMessage(qm) && qm.convId === convId);
+}
+
+export function removeQueuedMessageByReference(state: RenderState, message: QueuedMessage): boolean {
+  const idx = state.queuedMessages.indexOf(message);
+  if (idx === -1) return false;
+  state.queuedMessages.splice(idx, 1);
+  return true;
+}
+
+export function removeNewConversationQueuedMessage(state: RenderState, convId: string): boolean {
+  const idx = state.queuedMessages.findIndex(qm => isNewConversationQueuedMessage(qm) && qm.convId === convId);
+  if (idx === -1) return false;
+  state.queuedMessages.splice(idx, 1);
+  return true;
+}
+
+export function removeFirstDaemonQueuedMessageForConversation(state: RenderState, convId: string): boolean {
+  const idx = state.queuedMessages.findIndex(qm => !isGlobalIdleQueuedMessage(qm) && qm.convId === convId);
+  if (idx === -1) return false;
+  state.queuedMessages.splice(idx, 1);
+  return true;
+}
+
+/**
+ * Open the queue prompt for the current prompt buffer.
+ *
+ * The text is intentionally stored unexpanded so canceling the modal restores
+ * exactly what the user typed. Macros are expanded only on confirm, when the
+ * message is actually sent or queued.
+ *
+ * Images are copied into the queue prompt so they travel with the queued
+ * message, but they remain in state.pendingImages until the user actually
+ * confirms queueing/sending. That keeps the promptline image indicator visible
+ * while the modal is open.
+ */
+export function openQueuePrompt(state: RenderState, text: string): void {
+  state.queuePrompt = {
+    text,
+    selection: "message-end",
+    images: state.pendingImages.length > 0 ? [...state.pendingImages] : undefined,
+  };
+}
+
+// ── Key handling ───────────────────────────────────────────────────
+
+export interface QueueKeyResult {
+  type: "handled" | "confirm" | "cancel";
+}
+
+/**
+ * Handle a key event while the queue prompt overlay is active.
+ * Returns "confirm" when the user picks a timing, "cancel" on Escape.
+ */
+export function handleQueuePromptKey(key: KeyEvent, state: RenderState): QueueKeyResult {
+  const qp = state.queuePrompt!;
+
+  switch (key.type) {
+    case "char":
+      if (key.char === "h" || key.char === "k") {
+        qp.selection = "message-end";
+      } else if (key.char === "l" || key.char === "j") {
+        qp.selection = "next-turn";
+      }
+      return { type: "handled" };
+    case "left":
+    case "up":
+      qp.selection = "message-end";
+      return { type: "handled" };
+    case "right":
+    case "down":
+      qp.selection = "next-turn";
+      return { type: "handled" };
+    case "tab":
+      qp.selection = qp.selection === "message-end" ? "next-turn" : "message-end";
+      return { type: "handled" };
+    case "enter":
+      return { type: "confirm" };
+    case "escape":
+      return { type: "cancel" };
+    default:
+      return { type: "handled" };
+  }
+}
+
+// ── Confirm / cancel ───────────────────────────────────────────────
+
+export type ConfirmResult =
+  | { action: "send_direct"; text: string; images?: ImageAttachment[] }
+  | { action: "queue"; convId: string; text: string; timing: QueueTiming; images?: ImageAttachment[] }
+  | { action: "cancel" };
+
+/**
+ * Confirm the queued message. Returns what the caller should do:
+ * - send_direct: streaming finished, send immediately
+ * - queue: send queue_message to daemon + add local shadow
+ * - cancel: no conversation, can't queue
+ */
+export function confirmQueueMessage(state: RenderState): ConfirmResult {
+  const qp = state.queuePrompt!;
+  const timing = qp.selection;
+  const convId = state.convId;
+
+  // If streaming already finished while the overlay was showing, send directly.
+  // This is a real send path, so expand macros here rather than when the modal
+  // opens (so cancel can still restore the raw prompt text).
+  if (!isStreaming(state) && convId) {
+    const text = expandMacros(qp.text);
+    const images = qp.images;
+    if (images?.length) state.pendingImages = [];
+    state.queuePrompt = null;
+    state.inputBuffer = "";
+    state.cursorPos = 0;
+    return { action: "send_direct", text, images };
+  }
+
+  if (!convId) {
+    // No conversation — can't queue. Restore the raw text to prompt.
+    state.inputBuffer = qp.text;
+    state.cursorPos = qp.text.length;
+    state.queuePrompt = null;
+    return { action: "cancel" };
+  }
+
+  // Queue the message — local shadow for display. Store the expanded text so
+  // the shadow matches what the daemon will later echo back as a user message.
+  const images = qp.images;
+  const text = expandMacros(qp.text);
+  const queued: QueuedMessage = { convId, text, timing, images };
+  if (images?.length) state.pendingImages = [];
+  state.queuedMessages.push(queued);
+  state.queuePrompt = null;
+  state.inputBuffer = "";
+  state.cursorPos = 0;
+  return { action: "queue", convId, text, timing, images };
+}
+
+/**
+ * Cancel the queue prompt — restore the text to the input buffer.
+ *
+ * Images stay in pendingImages while the modal is open, so there's nothing to
+ * restore here.
+ */
+export function cancelQueuePrompt(state: RenderState): void {
+  const qp = state.queuePrompt!;
+  state.inputBuffer = qp.text;
+  state.cursorPos = qp.text.length;
+  state.queuePrompt = null;
+}
+
+// ── Drain (local shadow cleanup) ──────────────────────────────────
+
+/**
+ * Remove a single local shadow whose convId and text match.
+ * Called when the daemon consumes a queued message (user_message event)
+ * or when the user manually unqueues one (edit_message_confirm).
+ */
+export function removeLocalQueueEntry(state: RenderState, convId: string, text: string): void {
+  const idx = state.queuedMessages.findIndex(
+    qm => !isGlobalIdleQueuedMessage(qm) && qm.convId === convId && qm.text === text,
+  );
+  if (idx !== -1) state.queuedMessages.splice(idx, 1);
+}
+
+/**
+ * Remove daemon-owned local shadow entries for a conversation.
+ * Called on conversation refresh/reload — NOT on streaming_stopped,
+ * since the daemon drains queued messages one at a time (each
+ * removal is handled individually by the user_message event handler).
+ *
+ * TUI-only /queue entries intentionally survive conversation switches because
+ * they are owned by this client and may target a background conversation.
+ */
+export function clearLocalQueue(state: RenderState, convId: string): void {
+  state.queuedMessages = state.queuedMessages.filter(qm => qm.convId !== convId || isGlobalIdleQueuedMessage(qm));
+}
+
+/** Remove every queued shadow for a conversation, including TUI-only /queue. */
+export function clearAllQueuedMessagesForConversation(state: RenderState, convId: string): void {
+  state.queuedMessages = state.queuedMessages.filter(qm => qm.convId !== convId);
+}

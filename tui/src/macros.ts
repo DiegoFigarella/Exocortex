@@ -1,0 +1,324 @@
+/**
+ * Macro command definitions and expansion.
+ *
+ * Macros are text-replacement shortcuts that live entirely in the TUI.
+ * They expand inline in user messages before sending to the daemon.
+ * e.g. "/go" becomes "Go ahead and implement that".
+ *
+ * Macros can appear anywhere in a message — start, middle, after a
+ * newline — and are expanded at word boundaries. They are never sent
+ * to the daemon as slash commands; the daemon only sees the expanded text.
+ *
+ * ── Adding a new macro ───────────────────────────────────────────
+ *
+ * Add a single entry to the MACROS array below. Everything else —
+ * autocomplete, prompt highlighting, sub-arg completion, expansion —
+ * is derived automatically.
+ *
+ *   { name: "/example", desc: "Short description", expansion: "Full text sent to daemon" }
+ *
+ * To add sub-arguments (e.g. "/example foo"):
+ *
+ *   {
+ *     name: "/example",
+ *     desc: "Short description",
+ *     expansion: "Default expansion for /example",
+ *     args: [
+ *       { name: "foo", desc: "Foo variant", expansion: "Expansion for /example foo" },
+ *     ],
+ *   }
+ *
+ * Args can nest arbitrarily deep (e.g. "/tool install discord"):
+ *
+ *   {
+ *     name: "/tool",
+ *     desc: "Manage tools",
+ *     expansion: "...",
+ *     args: [
+ *       {
+ *         name: "install", desc: "Install a tool", expansion: "...",
+ *         args: [
+ *           { name: "discord", desc: "discord-cli", expansion: "Install discord-cli..." },
+ *         ],
+ *       },
+ *     ],
+ *   }
+ */
+
+import { readdirSync } from "fs";
+import { repoRoot, externalToolsDir, externalToolsTrashDir } from "@exocortex/shared/paths";
+import type { CompletionItem } from "./commands";
+
+// ── Exocortex paths ──────────────────────────────────────────────
+
+const EXO_ROOT = repoRoot();
+const TOOLS_DIR = externalToolsDir();
+const TOOLS_TRASH_DIR = externalToolsTrashDir();
+
+// ── Single source of truth ───────────────────────────────────────
+
+interface MacroArg {
+  name: string;
+  desc: string;
+  expansion: string;
+  args?: MacroArg[];
+}
+
+interface MacroDef {
+  name: string;
+  desc: string;
+  expansion: string;
+  args?: MacroArg[];
+}
+
+interface ExternalToolSpec {
+  cliName: string;
+  repo: string;
+}
+
+interface InstalledExternalTool {
+  argName: string;
+  dirName: string;
+}
+
+const EXTERNAL_TOOL_SPECS: ExternalToolSpec[] = [
+  { cliName: "discord-cli", repo: "git@github.com:Yeyito777/discord-cli.git" },
+  { cliName: "exo-cli", repo: "https://github.com/Yeyito777/exo-cli.git" },
+  { cliName: "gmail-cli", repo: "https://github.com/Yeyito777/gmail-cli.git" },
+  { cliName: "qutebrowser-cli", repo: "https://github.com/Yeyito777/qutebrowser-cli.git" },
+  { cliName: "twitter-cli", repo: "https://github.com/Yeyito777/twitter-cli.git" },
+  { cliName: "whatsapp-cli", repo: "https://github.com/Yeyito777/whatsapp-cli.git" },
+  { cliName: "xenv-cli", repo: "https://github.com/Yeyito777/xenv-cli.git" },
+];
+
+function externalToolShortName(cliName: string): string {
+  return cliName.replace(/-cli$/, "");
+}
+
+/** Read installed external tool directories from disk for dynamic uninstall completions. */
+function installedExternalTools(): InstalledExternalTool[] {
+  try {
+    return readdirSync(TOOLS_DIR, { withFileTypes: true })
+      .filter(entry => entry.isDirectory() && !entry.name.startsWith("."))
+      .map(entry => ({
+        argName: externalToolShortName(entry.name),
+        dirName: entry.name,
+      }))
+      .sort((a, b) => a.argName.localeCompare(b.argName));
+  } catch {
+    return [];
+  }
+}
+
+/** Build a tool-install expansion string with the dynamic paths. */
+function toolInstall(spec: ExternalToolSpec): MacroArg {
+  const { cliName, repo } = spec;
+  return {
+    name: externalToolShortName(cliName), desc: cliName,
+    expansion: `Install the ${cliName} tool for yourself. Clone ${repo} into ${TOOLS_DIR}/${cliName}, then follow the README/setup instructions to build and install it. If the tool requires authentication or API tokens, walk me through the setup step by step — ask me for any credentials or config values you need.`,
+  };
+}
+
+/** Build a tool-uninstall expansion string with the dynamic paths. */
+function toolUninstall(dirName: string): MacroArg {
+  return {
+    name: externalToolShortName(dirName), desc: dirName,
+    expansion: `Uninstall the ${dirName} tool for yourself. Move ${TOOLS_DIR}/${dirName} into ${TOOLS_TRASH_DIR}/ (create the trash directory if needed, and add a timestamp suffix instead of overwriting if a folder with that name is already there). Do not delete it outright. After moving it, check whether the tool's README mentions any extra cleanup steps and walk me through them if needed.`,
+  };
+}
+
+function dynamicToolUninstallArgs(): MacroArg[] {
+  return installedExternalTools().map(tool => toolUninstall(tool.dirName));
+}
+
+const EXOCORTEX_QUALITY_WORKTREE_PROMPT = "Work in a git worktree for this task. Find the repo root first (the directory containing .git/; don't assume CWD is it). From there, create the worktree with `./scripts/dev/create-worktree <name>`. Work inside that worktree. When I say I'm satisfied, merge back to main and clean up with `./scripts/dev/clean-worktree <name-or-path>`.";
+
+const AUTORESEARCH_PROMPT = "You're going to autoresearch. Set yourself a goal in accordance with the topic, and when you set it use pausable=false and completable=false so the goal is unpausable and uncompletable. You're going to make a dir in the project where you're autoresearching called \"autoresearch/<topic>\" where you're going to log all experiment failures and successes. On success you commit, on failure you stash / delete the failure. Such that over long enough time compunding experiments better the benchmark. To know which experiments to keep / trash you must create a benchmark first to measure what it is we're trying to autoresearch. Performance? Quality? etc... etc... such that all experiments are deterministic to this benchmark, and you can choose which to keep and which to trash objectively, the benchmark must be the first thing you make before delving into experiments. Make sure to not use subagents. With all that said, this is the user request to autoresearch, you choose how to interpret this as a benchmark and how to start going into the research direction. Make sure to ask him 5 questions before you actually start, make sure to set yourself the goal AFTER the user has answered the five questions:";
+
+const AUTORESEARCH_STOP_PROMPT = "You're going to stop autoresearching. Make sure to wrap up your last experiment and tidy everything up. Finally create an html report of the autoresearch Format your would-be response in HTML use dark-mode for styling, user tables, graphs, interactive buttons, or whatever method you consider to be best for displaying the information you want to convey to the user. Save it to a file in ~/Workspace/playground/ and give me the absolute file path.";
+
+function exocortexQualityPrompt(component: "tui" | "daemon"): string {
+  const testingPrompt = component === "tui"
+    ? "Once done, test end to end with xenv to make sure nothing broke."
+    : "Once done, test the daemon in the worktree end to end with exo-cli to make sure nothing broke. Check exo-cli -h first to see how to test in worktree.";
+
+  return `Check the code quality of exocortex's ${component}. Fix the code quality issues you think are worth fixing, let's prioritize the modularity and longevity of this codebase. ${EXOCORTEX_QUALITY_WORKTREE_PROMPT} ${testingPrompt}`;
+}
+
+const MACROS: MacroDef[] = [
+  { name: "/consider", desc: "Am I right or wrong?", expansion: "Consider what I'm saying. Am I right or wrong?" },
+  {
+    name: "/commit", desc: "Commit and push", expansion: "If you haven't already, commit your work and push it.",
+    args: [
+      { name: "exocortex", desc: `Commit ${EXO_ROOT}`, expansion: `If you haven't already, commit and push the work inside the Exocortex directory (${EXO_ROOT}).` },
+    ],
+  },
+  { name: "/noop", desc: "Thoughts only, no edits", expansion: "Don't do any destructive or modificating actions just yet just tell me your thoughts on this" },
+  {
+    name: "/plan", desc: "Plan only, no edits", expansion: "Come up with a plan for this and tell me it. Don't write or edit any files.",
+    args: [
+      { name: "other", desc: "Draft plan for another instance", expansion: "Draft a plan for this as a prompt for another instance. Write it as a kebab-case markdown file inside ~/.config/exocortex/storage/playground/. The file should be self-contained so I can send it to another instance and he gets all the context he needs to work on it." },
+    ],
+  },
+  { name: "/fix", desc: "Go ahead and fix it", expansion: "Go ahead and fix it" },
+  { name: "/go", desc: "Go ahead and implement", expansion: "Go ahead and implement that" },
+  { name: "/questions", desc: "Any questions?", expansion: "Before we proceed, any questions?" },
+  { name: "/thoughts", desc: "Tell me your thoughts", expansion: "Can you tell me your thoughts on this?" },
+  { name: "/long", desc: "Work until complete", expansion: "This is a long running task, work tirelessly until you can verify that everything is complete and correct" },
+  { name: "/html", desc: "Respond with saved HTML", expansion: "Format your would-be response in HTML use dark-mode for styling, user tables, graphs, interactive buttons, or whatever method you consider to be best for displaying the information you want to convey to the user. Save it to a file in ~/Workspace/playground/ and give me the absolute file path." },
+  {
+    name: "/autoresearch",
+    desc: "Start autoresearch",
+    expansion: AUTORESEARCH_PROMPT,
+    args: [
+      { name: "stop", desc: "Stop autoresearching", expansion: AUTORESEARCH_STOP_PROMPT },
+    ],
+  },
+  { name: "/xenv", desc: "Test in xenv until complete", expansion: "You're going to test this in a xenv and go into a loop: build → test in xenv → fix anything that's wrong → ... until it's complete" },
+  {
+    name: "/publish", desc: "Publish this", expansion: "Start git tracking this, first checking for secrets/private artifacts/history that should not be published. Make a gitignore, MIT license it if appropriate, make upstream repo with gh tool, make it public, give brief description, and commit and push",
+    args: [
+      { name: "closed", desc: "Publish privately", expansion: "Start git tracking this, first checking for secrets/private artifacts/history that should not be committed. Make a gitignore, make upstream repo with gh tool, make it private, give brief description, and commit and push" },
+    ],
+  },
+  { name: "/diagnose", desc: "Pinpoint the cause", expansion: "Can you pinpoint the exact cause and tell me your diagnosis?" },
+  {
+    name: "/improve",
+    desc: "Improve Exocortex from friction",
+    expansion: "Run an Exocortex self-improvement pass: analyze this conversation for mistakes/friction, especially around internal tools, external tools, and the tooling system; inspect the relevant Exocortex/tool code; check recent conversations for recurring patterns; then pick one high-confidence fix and implement it in an Exocortex git worktree using ./scripts/dev/create-worktree <name>. Test it appropriately and report the worktree, changes, tests, and follow-up ideas.",
+    args: [
+      {
+        name: "plan",
+        desc: "Analyze only",
+        expansion: "Run an Exocortex self-improvement pass: analyze this conversation for mistakes/friction, especially around internal tools, external tools, and the tooling system; inspect the relevant Exocortex/tool code; and check recent conversations for recurring patterns. Then report the best improvement candidates, but don't edit files yet.",
+      },
+    ],
+  },
+  { name: "/quality", desc: "Code quality assessment", expansion: "Give the changes a code quality assesment. Is there anything that should be split off into other files, de-duplicated, or made more clear? If so, do it." },
+  {
+    name: "/exocortex",
+    desc: "Exocortex repo tasks",
+    expansion: "What would you like to do in the Exocortex repo?",
+    args: [
+      { name: "tui-quality", desc: "Improve TUI code quality in a worktree", expansion: exocortexQualityPrompt("tui") },
+      { name: "daemon-quality", desc: "Improve daemon code quality in a worktree", expansion: exocortexQualityPrompt("daemon") },
+    ],
+  },
+  {
+    name: "/worktree", desc: "Work in a git worktree",
+    expansion: `Work in a git worktree for this task. Find the repo root first (the directory containing .git/; don't assume CWD is it). From there, create the worktree with \`./scripts/dev/create-worktree <name>\`. Work inside that worktree. When I say I'm satisfied, merge back to main and clean up with \`./scripts/dev/clean-worktree <name-or-path>\`.`,
+    args: [
+      { name: "setup", desc: "Set up worktree flow for a project", expansion: "Set up git worktree management flow for the project. If the project is not already a git repo, initialize git first. Use the existing Exocortex flow as the reference implementation: ~/Workspace/exocortex/scripts/dev/create-worktree, ~/Workspace/exocortex/scripts/dev/clean-worktree, ~/Workspace/exocortex/scripts/dev/worktree-common.sh, ~/Workspace/exocortex/.gitignore, ~/Workspace/exocortex/.githooks/post-checkout, and ~/Workspace/exocortex/scripts/dev/exotest. Also check ~/Workspace/active-development/record/scripts/dev/create-worktree, clean-worktree, worktree-common.sh, and recordtest for a smaller app-specific version. Adapt the flow to this project's deps/config/runtime/test needs, make scripts executable, update .gitignore, then smoke-test create + clean with a temporary worktree and leave no temp branch/worktree behind. Project:" },
+      { name: "ready", desc: "Merge main in, resolve conflicts, assess", expansion: "Merge local main into the worktree branch (use local main, not origin — it's always up to date), resolve any merge conflicts, and give the result a code assessment. Stop and report so I can review before merging." },
+      { name: "merge", desc: "Merge worktree back into main", expansion: "The work in the worktree is good. Merge it back into main. After confirming the merge succeeded, run `./scripts/dev/clean-worktree <name-or-path>` from the repo root to remove the worktree, delete its branch, and clean up any worktree config leftovers." },
+      { name: "clean", desc: "Reject/discard worktree", expansion: "The work in this worktree is rejected. Do not merge it, do not preserve the changes, and do not try to salvage the branch. Find the repo root first, identify the target worktree from the current directory or from the name/path I provide, verify it is a linked worktree and not main, then remove it and delete its branch. Prefer the project cleanup script, e.g. `./scripts/dev/clean-worktree <name-or-path>`. If cleanup refuses because the worktree is dirty or the branch is unmerged, explicitly discard the worktree changes and force-remove the worktree/branch. Clean up any worktree runtime/config leftovers if the project has them. Report what was removed." },
+    ],
+  },
+  {
+    name: "/tool",
+    desc: "Manage external tools",
+    expansion: "Explain to me how the external tools system works in Exocortex.",
+    args: [
+      {
+        name: "install",
+        desc: "Install an external tool",
+        expansion: "Explain to me how the installation process for a tool looks in Exocortex.",
+        args: EXTERNAL_TOOL_SPECS.map(toolInstall),
+      },
+      {
+        name: "uninstall",
+        desc: "Uninstall an external tool",
+        expansion: "Explain to me how the uninstallation process for a tool looks in Exocortex.",
+      },
+    ],
+  },
+  { name: "/update", desc: "Update Exocortex", expansion: "Update Exocortex. Pull the latest changes from github, install anything that needs to be installed and then tell me to run \"exocortexd restart\" in my terminal when ready" },
+];
+
+// ── Recursive flattening helpers ────────────────────────────────
+
+/** Flatten a macro tree into [key, expansion] pairs for the macro map. */
+function flattenExpansions(prefix: string, node: { expansion: string; args?: MacroArg[] }): [string, string][] {
+  const entries: [string, string][] = [[prefix, node.expansion]];
+  for (const arg of node.args ?? []) {
+    entries.push(...flattenExpansions(`${prefix} ${arg.name}`, arg));
+  }
+  return entries;
+}
+
+/** Flatten a macro tree into [key, CompletionItem[]] pairs for the arg registry. */
+function flattenArgLists(prefix: string, node: { args?: MacroArg[] }): [string, CompletionItem[]][] {
+  if (!node.args || node.args.length === 0) return [];
+  const entries: [string, CompletionItem[]][] = [
+    [prefix, node.args.map(a => ({ name: a.name, desc: a.desc }))],
+  ];
+  for (const arg of node.args) {
+    entries.push(...flattenArgLists(`${prefix} ${arg.name}`, arg));
+  }
+  return entries;
+}
+
+const STATIC_MACRO_MAP: Record<string, string> = Object.fromEntries(
+  MACROS.flatMap(m => flattenExpansions(m.name, m)),
+);
+
+const STATIC_MACRO_ARGS: Record<string, CompletionItem[]> = Object.fromEntries(
+  MACROS.flatMap(m => flattenArgLists(m.name, m)),
+);
+
+// ── Derived exports ──────────────────────────────────────────────
+
+/** Autocomplete entries for macros (base names only — args appear after selecting the base command). */
+export const MACRO_LIST: CompletionItem[] = MACROS.map(m => ({ name: m.name, desc: m.desc }));
+
+/** Expansion text for each macro, keyed by "/name" or "/name arg1 arg2 ...". */
+export function getMacroMap(): Record<string, string> {
+  return {
+    ...STATIC_MACRO_MAP,
+    ...Object.fromEntries(
+      dynamicToolUninstallArgs().map(arg => [`/tool uninstall ${arg.name}`, arg.expansion]),
+    ),
+  };
+}
+
+/** Sub-argument lists, keyed by "/name" or "/name arg1 ...". Used by autocomplete and prompt highlighting. */
+export function getMacroArgs(baseName?: string): Record<string, CompletionItem[]> {
+  const registry = Object.fromEntries(
+    Object.entries(STATIC_MACRO_ARGS)
+      .filter(([key]) => !baseName || key === baseName || key.startsWith(`${baseName} `)),
+  );
+
+  if (!baseName || baseName === "/tool") {
+    registry["/tool uninstall"] = dynamicToolUninstallArgs().map(arg => ({ name: arg.name, desc: arg.desc }));
+  }
+
+  return registry;
+}
+
+// ── Expansion ─────────────────────────────────────────────────────
+
+/**
+ * Expand macro commands in user message text.
+ *
+ * Captures a slash command followed by any number of trailing words,
+ * then tries longest-prefix match in the macro map. Unrecognised trailing
+ * words are preserved after the expansion.
+ *
+ * Only matches at word boundaries (start of line or after whitespace).
+ */
+export function expandMacros(text: string): string {
+  const macroMap = getMacroMap();
+
+  return text.replace(/(?<=^|\s)(\/[\w-]+(?:[ \t]+[\w-]+)*)/gm, (full) => {
+    const words = full.split(/[ \t]+/);
+    // Try longest prefix first
+    for (let len = words.length; len >= 1; len--) {
+      const key = words.slice(0, len).join(" ");
+      if (macroMap[key]) {
+        const remainder = words.slice(len).join(" ");
+        return remainder ? macroMap[key] + " " + remainder : macroMap[key];
+      }
+    }
+    return full;
+  });
+}

@@ -1,0 +1,106 @@
+#!/usr/bin/env bash
+# exotest — launch a worktree's daemon + TUI for testing, clean up on exit.
+#
+# Usage:
+#   exotest <worktree>
+#
+# <worktree> can be:
+#   - A bare name:       exotest fix-prompt-scroll
+#   - A relative path:   exotest .worktrees/fix-prompt-scroll
+#   - An absolute path:  exotest /home/.../Exocortex/.worktrees/fix-prompt-scroll
+#
+# Starts the worktree's daemon (if not already running), launches the TUI,
+# and kills the daemon when the TUI exits.
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+# shellcheck source=./worktree-common.sh
+source "$SCRIPT_DIR/worktree-common.sh"
+DAEMON_PID=""
+
+cleanup() {
+  if [[ -n "$DAEMON_PID" ]] && kill -0 "$DAEMON_PID" 2>/dev/null; then
+    kill "$DAEMON_PID" 2>/dev/null
+    wait "$DAEMON_PID" 2>/dev/null || true
+  fi
+}
+trap cleanup EXIT
+
+# ── Resolve worktree ────────────────────────────────────────────────
+
+INPUT="${1:-}"
+WORKTREE_DIR="$(resolve_worktree_dir "$INPUT")"
+
+[[ -d "$WORKTREE_DIR" ]]        || worktree_die "Not found: $WORKTREE_DIR"
+[[ -d "$WORKTREE_DIR/daemon" ]] || worktree_die "No daemon/ in $WORKTREE_DIR"
+[[ -d "$WORKTREE_DIR/tui" ]]    || worktree_die "No tui/ in $WORKTREE_DIR"
+
+WT_NAME=$(basename "$WORKTREE_DIR")
+
+echo ""
+echo "  exotest — $WT_NAME"
+echo "  $WORKTREE_DIR"
+echo ""
+
+# ── Dependencies ────────────────────────────────────────────────────
+
+# Always run bun install — it's idempotent and fast (~200ms) when
+# everything is resolved, and catches stale/partial node_modules.
+sync_dependency_artifacts "$WORKTREE_DIR"
+(cd "$WORKTREE_DIR" && bun install --silent)
+
+# ── Shared local resources ──────────────────────────────────────────
+
+sync_shared_secrets "$WORKTREE_DIR"
+sync_external_tools "$WORKTREE_DIR"
+
+# ── Daemon ──────────────────────────────────────────────────────────
+
+CONFIG_DIR="$WORKTREE_DIR/config"
+RUNTIME_DIR="$CONFIG_DIR/runtime/$WT_NAME"
+PID_FILE="$RUNTIME_DIR/exocortexd.pid"
+SOCKET="$RUNTIME_DIR/exocortexd.sock"
+LOG="$RUNTIME_DIR/exocortexd.log"
+
+# Check if a daemon is already alive for this worktree
+DAEMON_ALIVE=false
+if [[ -f "$PID_FILE" ]]; then
+  OLD_PID=$(cat "$PID_FILE" 2>/dev/null || true)
+  if [[ -n "$OLD_PID" ]] && kill -0 "$OLD_PID" 2>/dev/null; then
+    DAEMON_ALIVE=true
+  fi
+fi
+
+if $DAEMON_ALIVE; then
+  echo "  Daemon already running (pid $OLD_PID)"
+else
+  mkdir -p "$RUNTIME_DIR"
+  # A previous test daemon can leave a stale unix socket behind after it exits.
+  # If we let the readiness loop see that stale socket, the TUI may start while
+  # the new daemon is still unlinking/rebinding it, producing connect ENOENT.
+  rm -f "$SOCKET"
+  rm -f "$PID_FILE"
+
+  echo "  Starting daemon (log: $LOG)"
+  (cd "$WORKTREE_DIR/daemon" && exec bun run src/main.ts >>"$LOG" 2>&1) &
+  DAEMON_PID=$!
+
+  # Wait for the new socket to appear (up to 5s)
+  for _ in $(seq 1 50); do
+    [[ -S "$SOCKET" ]] && break
+    # Bail early if the daemon process died
+    kill -0 "$DAEMON_PID" 2>/dev/null || worktree_die "Daemon exited early (check $LOG)"
+    sleep 0.1
+  done
+  [[ -S "$SOCKET" ]] || worktree_die "Daemon socket didn't appear after 5s (check $LOG)"
+  sleep 0.2  # brief grace period between socket bind and listen
+
+  echo "  Daemon ready (pid $DAEMON_PID)"
+fi
+
+echo ""
+
+# ── TUI ─────────────────────────────────────────────────────────────
+
+(cd "$WORKTREE_DIR/tui" && exec bun run src/main.ts)

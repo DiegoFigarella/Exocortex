@@ -1,0 +1,17 @@
+{
+  "name": "@exocortex/shared",
+  "version": "0.1.0",
+  "type": "module",
+  "exports": {
+    "./auth": "./src/auth.ts",
+    "./messages": "./src/messages.ts",
+    "./config": "./src/config.ts",
+    "./model-display": "./src/model-display.ts",
+    "./protocol": "./src/protocol.ts",
+    "./paths": "./src/paths.ts"
+  },
+  "devDependencies": {
+    "@types/bun": "latest",
+    "typescript": "^5.7"
+  }
+}

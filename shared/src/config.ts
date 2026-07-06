@@ -1,0 +1,374 @@
+/**
+ * Shared Exocortex config loader.
+ *
+ * The canonical user-facing config file is config/config.json.  Older
+ * installs may still have config/theme.json; we read it as a compatibility
+ * fallback only when config.json is absent.
+ */
+
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "fs";
+import { homedir } from "os";
+import { isAbsolute, join, resolve } from "path";
+import {
+  DEFAULT_MODEL_BY_PROVIDER,
+  DEFAULT_PROVIDER_ID,
+  EFFORT_LEVELS,
+  defaultEffortForModelId,
+  type EffortLevel,
+  type ModelId,
+  type ProviderId,
+} from "./messages";
+import { agentCwdDir, configDir, repoRoot } from "./paths";
+
+export type SafetyDenylistEntry = string | {
+  /** Human-readable explanation shown when any pattern in this group matches. */
+  reason?: string;
+  /** String/glob patterns denied for the tool. */
+  patterns: string[];
+};
+
+export interface SafetyConfig {
+  /** Set to false to disable all safety denylist checks. Defaults to true. */
+  enabled?: boolean;
+  /** Optional grouped form: safety.denylist.<toolName> = SafetyDenylistEntry[]. */
+  denylist?: Record<string, SafetyDenylistEntry[]>;
+  /** Optional simple form: safety.<toolName> = SafetyDenylistEntry[]. */
+  [toolName: string]: unknown;
+}
+
+export interface OpenCommandConfig {
+  /** Executable to spawn when opening a matching target. */
+  command: string;
+  /** Arguments passed to command. Supports {target}, {path}, {target:sh}, and {path:sh}. */
+  args?: string[];
+}
+
+export interface OpenFileRuleConfig extends OpenCommandConfig {
+  /** File extensions handled by this opener, without a leading dot. */
+  extensions: string[];
+}
+
+export interface OpenersConfig {
+  /** Opener used for http/https links. Set to null to disable link opening. */
+  url?: OpenCommandConfig | null;
+  /** File openers matched by extension, checked in order. */
+  rules?: OpenFileRuleConfig[];
+}
+
+export interface OpenAIProviderConfig {
+  /**
+   * If true, an OpenAI usage_limit_reached 429 with a reset timestamp keeps the
+   * stream open and retries when the usage window resets. Defaults to false.
+   */
+  retryOnUsageLimitReset?: boolean;
+}
+
+export interface DeepSeekProviderConfig {
+  /** Override the OpenAI-compatible DeepSeek API base URL. Defaults to https://api.deepseek.com. */
+  baseUrl?: string;
+}
+
+export interface ProvidersConfig {
+  openai?: OpenAIProviderConfig;
+  deepseek?: DeepSeekProviderConfig;
+  /** Preserve unknown provider config blocks. */
+  [provider: string]: unknown;
+}
+
+export interface AgentConfig {
+  /** Default working directory used by the daemon and agent tools. Relative paths resolve from the repo root. */
+  workingDirectory?: string;
+}
+
+export type PingMode = "sound" | "notif" | "both";
+
+export interface PingConfig {
+  /** What the TUI should do when an assistant stream finishes. */
+  mode?: PingMode | null;
+  /** Sound file used by mode "sound" or "both". */
+  sound?: string | null;
+}
+
+export interface ConversationDefaultsConfig {
+  /** Provider used for newly-created conversations when a client does not override it. */
+  provider?: ProviderId;
+  /** Provider-scoped model id used for newly-created conversations. */
+  model?: ModelId;
+  /** Reasoning effort used for newly-created conversations. */
+  effort?: EffortLevel;
+  /** Whether OpenAI fast service tier is enabled for newly-created conversations. */
+  fastMode?: boolean;
+}
+
+export interface DefaultsConfig {
+  /** User-configured conversation defaults. Absence means product defaults. */
+  conversation?: ConversationDefaultsConfig;
+  /** Preserve unknown future/user default blocks. */
+  [key: string]: unknown;
+}
+
+export interface FeatureFlagsConfig {
+  /**
+   * Expose the internal Computer Use tool contract. Defaults to false; set true
+   * to enable desktop screenshots/input tools for this config.
+   */
+  computerUse?: boolean;
+  /** Expose the model-facing goal lifecycle tool. Defaults to true; set false to hide/disable it. */
+  goalTool?: boolean;
+  /** Preserve unknown future feature flags. */
+  [feature: string]: unknown;
+}
+
+export type TranscriptionBackend = "whisper-local" | "openai";
+
+export interface WhisperLocalConfig {
+  /** whisper.cpp server URL. Defaults to http://127.0.0.1:8910. */
+  url?: string;
+  /** whisper.cpp checkout directory (for auto-starting the server). Defaults to $WHISPER_CPP_DIR or <repo>/../../whispercpp/whisper.cpp. */
+  dir?: string;
+  /** ggml model path. Defaults to $WHISPER_MODEL or <dir>/models/ggml-base.en.bin. */
+  model?: string;
+}
+
+export interface TranscriptionConfig {
+  /** Voice transcription backend. Defaults to the self-hosted whisper.cpp server. */
+  backend?: TranscriptionBackend;
+  whisperLocal?: WhisperLocalConfig;
+}
+
+export interface ConversationDefaults {
+  provider: ProviderId;
+  model: ModelId;
+  effort: EffortLevel;
+  fastMode: boolean;
+}
+
+export interface TuiConfig {
+  /** If true, the TUI censors account/email labels in status and auth UI. */
+  hideSensitiveInfo?: boolean;
+}
+
+export interface ExocortexConfig {
+  /** Active TUI theme name. */
+  theme?: string;
+  /** Experimental/product feature gates. */
+  features?: FeatureFlagsConfig;
+  /** User-overridable app defaults. */
+  defaults?: DefaultsConfig;
+  /** Agent/runtime behavior. */
+  agent?: AgentConfig;
+  /** TUI ping behavior when an assistant stream finishes. */
+  ping?: PingConfig;
+  /** TUI display/privacy preferences. */
+  tui?: TuiConfig;
+  /** Legacy pre-/ping sound setting. Prefer ping.sound for new writes. */
+  sound?: string | null;
+  /** TUI open-on-enter commands for links and file paths. */
+  openers?: OpenersConfig;
+  /** Provider-specific behavior. */
+  providers?: ProvidersConfig;
+  /** Voice transcription backend selection. */
+  transcription?: TranscriptionConfig;
+  /** Tool safety policy. */
+  safety?: SafetyConfig;
+  /** Preserve unknown future/user keys. */
+  [key: string]: unknown;
+}
+
+export function defaultOpenersConfig(): OpenersConfig {
+  return {
+    url: { command: "xdg-open", args: ["{target}"] },
+    rules: [
+      {
+        extensions: [
+          "png", "jpg", "jpeg", "gif", "webp", "bmp", "tif", "tiff",
+          "avif", "heic", "heif", "svg", "ico", "jxl", "jp2", "ppm", "pgm",
+          "pbm", "pnm", "pdf",
+        ],
+        command: "show",
+        args: ["{path}"],
+      },
+      {
+        extensions: [
+          "mp3", "wav", "flac", "m4a", "aac", "ogg", "oga", "opus", "wma",
+          "aif", "aiff", "alac", "mid", "midi", "mov", "mp4", "m4v", "mkv",
+          "webm", "avi",
+        ],
+        command: "st",
+        args: ["-e", "zsh", "-ic", "exec audio-play {path:sh}"],
+      },
+      {
+        extensions: ["html"],
+        command: "xdg-open",
+        args: ["{path}"],
+      },
+      {
+        extensions: ["md", "py", "txt"],
+        command: "st",
+        args: ["-e", "zsh", "-ic", "exec nvim {path:sh}"],
+      },
+    ],
+  };
+}
+
+export function defaultExocortexConfig(): ExocortexConfig {
+  return {
+    theme: "whale",
+    features: { computerUse: false, goalTool: true },
+    transcription: { backend: "whisper-local" },
+    agent: { workingDirectory: ".exocortex-cwd" },
+    ping: { mode: null, sound: null },
+    openers: defaultOpenersConfig(),
+  };
+}
+
+function expandHome(path: string): string {
+  if (path === "~") return homedir();
+  if (path.startsWith("~/")) return join(homedir(), path.slice(2));
+  return path;
+}
+
+export function agentWorkingDirectory(config: ExocortexConfig = readExocortexConfig()): string {
+  const configured = config.agent?.workingDirectory;
+  const raw = typeof configured === "string" && configured.trim()
+    ? configured.trim()
+    : agentCwdDir();
+  const expanded = expandHome(raw);
+  return isAbsolute(expanded) ? resolve(expanded) : resolve(repoRoot(), expanded);
+}
+
+export function exocortexConfigPath(): string {
+  return join(configDir(), "config.json");
+}
+
+export function legacyThemeConfigPath(): string {
+  return join(configDir(), "theme.json");
+}
+
+function isObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function isProviderId(value: unknown): value is ProviderId {
+  return value === "openai" || value === "deepseek";
+}
+
+function isEffortLevel(value: unknown): value is EffortLevel {
+  return typeof value === "string" && (EFFORT_LEVELS as readonly string[]).includes(value);
+}
+
+function normalizeModelId(value: unknown): ModelId | null {
+  return typeof value === "string" && value.trim() !== "" ? value.trim() : null;
+}
+
+function parseJsonObject(path: string): Record<string, unknown> | null {
+  try {
+    const data = JSON.parse(readFileSync(path, "utf8"));
+    return isObject(data) ? data : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Read config/config.json. If it does not exist, fall back to legacy
+ * config/theme.json for the theme only.
+ */
+export function readExocortexConfig(): ExocortexConfig {
+  const main = exocortexConfigPath();
+  if (existsSync(main)) {
+    const data = parseJsonObject(main);
+    return data ? { ...data } as ExocortexConfig : {};
+  }
+
+  const defaultConfig = defaultExocortexConfig();
+
+  // Legacy migration: old installs used config/theme.json. If present, carry
+  // that theme into the generated config; otherwise default to whale.
+  const legacyTheme = parseJsonObject(legacyThemeConfigPath());
+  if (legacyTheme && typeof legacyTheme.theme === "string") {
+    defaultConfig.theme = legacyTheme.theme;
+  }
+
+  try {
+    writeExocortexConfig(defaultConfig);
+  } catch {
+    // If config cannot be written, still return the default so callers work.
+  }
+
+  return defaultConfig;
+}
+
+/** Write the whole config object to config/config.json. */
+export function writeExocortexConfig(config: ExocortexConfig): void {
+  mkdirSync(configDir(), { recursive: true });
+  writeFileSync(exocortexConfigPath(), JSON.stringify(config, null, 2) + "\n");
+}
+
+/** Read-modify-write helper that preserves unknown config keys. */
+export function updateExocortexConfig(mutator: (config: ExocortexConfig) => ExocortexConfig | void): ExocortexConfig {
+  const config = readExocortexConfig();
+  const replacement = mutator(config);
+  const next = replacement ?? config;
+  writeExocortexConfig(next);
+  return next;
+}
+
+export function productConversationDefaults(provider: ProviderId = DEFAULT_PROVIDER_ID): ConversationDefaults {
+  const model = DEFAULT_MODEL_BY_PROVIDER[provider];
+  return {
+    provider,
+    model,
+    effort: defaultEffortForModelId(provider, model),
+    fastMode: false,
+  };
+}
+
+/**
+ * Return the user-saved conversation defaults from a config object, if present.
+ * This performs only schema-level normalization; provider/model capability
+ * validation lives in the TUI/daemon, where the live provider registry exists.
+ */
+export function configuredConversationDefaults(config: ExocortexConfig = readExocortexConfig()): ConversationDefaults | null {
+  const defaults = config.defaults;
+  if (!isObject(defaults)) return null;
+  const conversation = defaults.conversation;
+  if (!isObject(conversation)) return null;
+
+  const provider = isProviderId(conversation.provider) ? conversation.provider : DEFAULT_PROVIDER_ID;
+  const model = normalizeModelId(conversation.model) ?? DEFAULT_MODEL_BY_PROVIDER[provider];
+  const effort = isEffortLevel(conversation.effort)
+    ? conversation.effort
+    : defaultEffortForModelId(provider, model);
+
+  return {
+    provider,
+    model,
+    effort,
+    fastMode: conversation.fastMode === true,
+  };
+}
+
+/** Return the active conversation defaults, falling back to product defaults. */
+export function effectiveConversationDefaults(config: ExocortexConfig = readExocortexConfig()): ConversationDefaults {
+  return configuredConversationDefaults(config) ?? productConversationDefaults();
+}
+
+/** Persist a complete user conversation default, preserving unrelated config keys. */
+export function saveConversationDefaults(defaults: ConversationDefaults): void {
+  updateExocortexConfig((config) => {
+    config.defaults = {
+      ...(isObject(config.defaults) ? config.defaults : {}),
+      conversation: { ...defaults },
+    };
+  });
+}
+
+/** Remove the user conversation default override, preserving unrelated config keys. */
+export function clearConversationDefaults(): void {
+  updateExocortexConfig((config) => {
+    if (!isObject(config.defaults)) return;
+    delete config.defaults.conversation;
+    if (Object.keys(config.defaults).length === 0) delete config.defaults;
+  });
+}

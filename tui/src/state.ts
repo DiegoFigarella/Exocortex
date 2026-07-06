@@ -1,0 +1,572 @@
+/**
+ * TUI render state.
+ *
+ * Owns the shape of the UI state that drives rendering.
+ * Message and block types live in messages.ts.
+ */
+
+import { createEmptyProviderAuthInfo } from "@exocortex/shared/auth";
+import { configuredConversationDefaults, effectiveConversationDefaults, productConversationDefaults, type ConversationDefaults } from "@exocortex/shared/config";
+import type { ProviderId, ProviderInfo, ModelId, EffortLevel, UsageData, ToolDisplayInfo, ExternalToolStyle, ImageAttachment, ModelInfo, TokenStatsSnapshot, UserMessage } from "./messages";
+import { DEFAULT_MODEL_BY_PROVIDER, defaultEffortForModelId, supportsImageInputsForModel } from "./messages";
+import type { Message, AIMessage, SystemMessage } from "./messages";
+import { loadPreferredProvider } from "./preferences";
+import { loadHideSensitiveInfoPreference } from "./privacy";
+import { theme } from "./theme";
+import type { MessageBound, RenderLineAnchor } from "./conversation";
+import type { WrapCopyLine } from "./textwrap";
+import type { PanelFocus } from "./focus";
+import type { ChatFocus } from "./chat";
+import type { SidebarState } from "./sidebar";
+import { createSidebarState } from "./sidebar";
+import type { VimState } from "./vim";
+import { createVimState } from "./vim";
+import type { HistoryCursor } from "./historycursor";
+import { createHistoryCursor } from "./historycursor";
+import type { SearchDirection } from "./search";
+import type { UndoState } from "./undo";
+import { createUndoState, markInsertEntry } from "./undo";
+import type { AutocompleteState } from "./autocomplete";
+import type { ConversationGoal, ProviderAuthInfo, QueueTiming } from "./protocol";
+import type { VoiceChatMessageState, VoicePromptState } from "./voice";
+
+// ── Queue types ────────────────────────────────────────────────────
+
+export type { QueueTiming } from "./protocol";
+
+export type QueueWaitTarget =
+  | { type: "global" }
+  | { type: "conversation"; convId: string; label: string }
+  | { type: "folder"; folderId: string; label: string };
+
+export interface QueuedMessage {
+  convId: string;
+  text: string;
+  timing: QueueTiming;
+  images?: ImageAttachment[];
+  /**
+   * Omitted/"daemon" means the daemon owns delivery timing (message-end/next-turn).
+   * "global-idle" is the TUI-only /queue FIFO that waits for every visible
+   * conversation and daemon-owned queued turn to finish before sending.
+   */
+  source?: "daemon" | "global-idle";
+  /** New-conversation /queue entries reserve a client conversation id here. */
+  target?: "conversation" | "new-conversation";
+  /** Captured draft settings for target === "new-conversation". */
+  provider?: ProviderId;
+  model?: ModelId;
+  effort?: EffortLevel;
+  fastMode?: boolean;
+  folderId?: string | null;
+  /** For TUI-owned queue entries, what must be idle before delivery. */
+  waitTarget?: QueueWaitTarget;
+}
+
+export interface QueuePromptState {
+  text: string;            // the message text being queued
+  selection: QueueTiming;  // which option is highlighted
+  images?: ImageAttachment[];
+}
+
+export interface AuthQueuedMessage {
+  text: string;
+  images?: ImageAttachment[];
+  echoStartedAt: number;
+}
+
+// ── Edit message modal types ──────────────────────────────────────
+
+/** Sentinel index for system instructions in the edit message modal. */
+export const EDIT_INDEX_INSTRUCTIONS = -2;
+/** Sentinel index for queued messages in the edit message modal. */
+export const EDIT_INDEX_QUEUED = -1;
+
+export interface EditMessageItem {
+  /** Index counting only user messages (0-based). -1 for queued, -2 for system instructions. */
+  userMessageIndex: number;
+  text: string;
+  isQueued: boolean;
+  images?: ImageAttachment[];
+  /** Original local message object, when this item represents a rendered user message. */
+  message?: UserMessage;
+  /** Actual object from state.messages before any canonicalization. */
+  sourceMessage?: UserMessage;
+  /** Original local queue object, when this item represents a queued message. */
+  queuedMessage?: QueuedMessage;
+}
+
+export interface EditMessageState {
+  items: EditMessageItem[];
+  selection: number;        // index into items[]
+  scrollOffset: number;     // for scrolling long lists
+}
+
+/** Cached layout values — set by the renderer, read by scroll and mouse functions. */
+export interface LayoutCache {
+  totalLines: number;      // total rendered message lines
+  messageAreaHeight: number; // visible rows for messages
+  chatCol: number;         // 1-based column where chat area starts
+  sepAbove: number;        // first row below the message area (search bar or separator)
+  firstInputRow: number;   // row number of first input line
+  sepBelow: number;        // row number of separator below prompt
+}
+
+export interface DeferredHistoryRenderState {
+  convId: string | null;
+  width: number;
+  /** First message index currently included in the rendered suffix. */
+  startMessageIndex: number;
+  /** Incremented when a new deferred render generation starts. */
+  generation: number;
+  /** True once the full conversation has been rendered. */
+  complete: boolean;
+}
+
+export interface SearchState {
+  barOpen: boolean;
+  barMode: "search" | "command";
+  direction: SearchDirection;
+  query: string;
+  barInput: string;
+  barCursorPos: number;
+  highlightsVisible: boolean;
+  savedScrollOffset: number;
+  savedHistoryCursor: HistoryCursor;
+  originChatFocus: ChatFocus;
+}
+
+export interface FolderInstructionsDocumentState {
+  folderId: string;
+  text: string;
+  savedText: string;
+  loading: boolean;
+}
+
+export interface RenderState {
+  messages: Message[];
+  /** The AI message currently being streamed (not yet finalized). */
+  pendingAI: AIMessage | null;
+  /** True when pendingAI was hydrated from a daemon snapshot rather than live local chunks. */
+  pendingAIHydratedFromSnapshot: boolean;
+  /**
+   * Started-at timestamp for a metadata-only pendingAI whose metadata should be
+   * hidden while waiting for the matching terminal streaming_stopped. This is
+   * set when a terminal stream notice (interrupt/error) arrives before any
+   * visible assistant content, and cleared for every new assistant turn.
+   */
+  suppressPendingAIMetadataStartedAt: number | null;
+  provider: ProviderId;
+  hasChosenProvider: boolean;
+  model: ModelId;
+  effort: EffortLevel;
+  fastMode: boolean;
+  goal: ConversationGoal | null;
+  convId: string | null;
+  inputBuffer: string;
+  cursorPos: number;
+  /** Preferred prompt column for repeated vertical movement (Vim curswant). */
+  promptCurswant: number | null;
+  cols: number;
+  rows: number;
+  scrollOffset: number;
+  /** Whether each provider currently has configured credentials. */
+  authByProvider: Record<ProviderId, boolean>;
+  /** Rich auth metadata for each provider, reported by the daemon. */
+  authInfoByProvider: Record<ProviderId, ProviderAuthInfo>;
+  /** Rate-limit usage data keyed by provider. Null until first update per provider. */
+  usageByProvider: Record<ProviderId, UsageData | null>;
+  /** Persistent token-accounting snapshot from the daemon. */
+  tokenStats: TokenStatsSnapshot | null;
+  /** Input tokens from the latest API round. Null until first context_update. */
+  contextTokens: number | null;
+  /** Which panel has focus — sidebar or chat. */
+  panelFocus: PanelFocus;
+  /** Which sub-panel within chat has focus — prompt or history. */
+  chatFocus: ChatFocus;
+  /** Conversations sidebar state. */
+  sidebar: SidebarState;
+  /** Vim keybind engine state. */
+  vim: VimState;
+  /** Cached layout values — updated each render, read by scroll functions. */
+  layout: LayoutCache;
+  /** Progressive chat-history render state used to paint large conversations quickly. */
+  deferredHistoryRender: DeferredHistoryRenderState | null;
+  /** Pending message to send after conversation is created. */
+  pendingSend: { active: boolean; text: string; images?: ImageAttachment[] };
+  /** Messages blocked on login; auto-sent after successful authentication. */
+  pendingAuthQueue: AuthQueuedMessage[];
+  /** Pending system instructions to apply after a conversation is created. */
+  pendingSystemInstructions: string | null;
+  /** Whether a just-created conversation should auto-generate its title. */
+  pendingGenerateTitleOnCreate: boolean;
+  /** Reserved id for a queued draft conversation that is still awaiting daemon creation. */
+  pendingQueuedDraftConvId: string | null;
+  /**
+   * User-invoked notices buffered while streaming.
+   *
+   * These render as a live tail after the active AI message so slash-command
+   * feedback stays visible at the bottom. Daemon-originated stream notices are
+   * inserted inline instead.
+   */
+  streamingTailMessages: SystemMessage[];
+  /**
+   * Index of an assistant message that was committed inline before the daemon
+   * sent streaming_stopped. Used to reconcile persisted abort/error blocks at
+   * the correct history position instead of appending a second assistant turn.
+   */
+  pendingAICommittedIndex: number | null;
+  /** Last daemon streamSeq observed per conversation, used to diagnose missed stream events. */
+  lastStreamSeqByConv: Record<string, number | undefined>;
+  /** Available tools reported by the daemon on connect. */
+  toolRegistry: ToolDisplayInfo[];
+  /** Available providers and models reported by the daemon on connect. */
+  providerRegistry: ProviderInfo[];
+  /** External tool styles for bash sub-command matching (from daemon). */
+  externalToolStyles: ExternalToolStyle[];
+  /** Whether tool result output is visible. Toggled with Ctrl+O. */
+  showToolOutput: boolean;
+  /** Whether user-identifying auth/account labels should be censored in the UI. */
+  hideSensitiveInfo: boolean;
+  /** Whether the active conversation currently has historical tool outputs loaded. */
+  toolOutputsLoaded: boolean;
+  /** Whether a tool-output fetch is currently in flight for the active conversation. */
+  toolOutputsLoading: boolean;
+  /** Whether Ctrl+O should auto-expand once the in-flight tool-output fetch completes. */
+  showToolOutputAfterLoad: boolean;
+  /** Cursor position in chat history (active when chatFocus === "history"). */
+  historyCursor: HistoryCursor;
+  /** Preferred history column for repeated j/k movement (Vim curswant). */
+  historyCurswant: number | null;
+  /** Visual mode anchor in chat history (row, col). Set when entering visual. */
+  historyVisualAnchor: HistoryCursor;
+  /** Cached rendered lines for history cursor navigation (ANSI included). */
+  historyLines: string[];
+  /** true for visual lines that are word-wrap continuations of the previous logical line. */
+  historyWrapContinuation: boolean[];
+  /** separator to reinsert before each continuation line when copying/yanking. */
+  historyWrapJoiners: string[];
+  /** Per-rendered-line source projection for vim yanks/copies. */
+  historyCopyLines: Array<WrapCopyLine | null>;
+  /** Per-message row ranges into historyLines (set by renderer). */
+  historyMessageBounds: MessageBound[];
+  /** Per-rendered-line semantic anchors into historyLines (set by renderer). */
+  historyLineAnchors: RenderLineAnchor[];
+  /** Undo/redo state for the prompt line. */
+  undo: UndoState;
+  /** Autocomplete popup state (command or path completion). */
+  autocomplete: AutocompleteState | null;
+  /** Scroll offset for the prompt input area (vim-style: only scrolls when cursor leaves viewport). */
+  promptScrollOffset: number;
+  /** Queue prompt overlay — non-null when the modal is showing. */
+  queuePrompt: QueuePromptState | null;
+  /** Chat-history search state for vim-style / and ? search. */
+  search: SearchState | null;
+  /** Messages queued for delivery at a specific timing. */
+  queuedMessages: QueuedMessage[];
+  /** Edit message modal — non-null when the modal is showing. */
+  editMessagePrompt: EditMessageState | null;
+  /** Images pasted from clipboard, waiting to be sent with the next message. */
+  pendingImages: ImageAttachment[];
+  /** Active hold-to-talk placeholder rendered inline in the prompt, if any. */
+  voicePrompt: VoicePromptState | null;
+  /** Completed recordings still being transcribed inline in the prompt. */
+  voicePromptJobs: VoicePromptState[];
+  /** Submitted voice transcription placeholder rendered as a local user message. */
+  voiceMessage: VoiceChatMessageState | null;
+  /** Folder-level AGENTS.md document currently open instead of a conversation. */
+  folderInstructionsDoc: FolderInstructionsDocumentState | null;
+  /** Current mouse cursor shape — used to avoid redundant cursor shape OSC writes. */
+  mouseCursor: "pointer" | "text" | "hand";
+}
+
+/** Streaming state is derived from pendingAI — no separate boolean. */
+export function isStreaming(state: RenderState): boolean {
+  return state.pendingAI !== null;
+}
+
+/** Clear pending AI state — always use this instead of setting pendingAI = null directly. */
+export function clearPendingAI(state: RenderState): void {
+  state.pendingAI = null;
+  state.pendingAIHydratedFromSnapshot = false;
+  state.pendingAICommittedIndex = null;
+  state.suppressPendingAIMetadataStartedAt = null;
+}
+
+/** Clear the live streaming tail used for user-invoked notices. */
+export function clearStreamingTailMessages(state: RenderState): void {
+  state.streamingTailMessages = [];
+}
+
+/** Fully reset historical tool-output state (used when clearing/switching chats). */
+export function resetToolOutputState(state: RenderState): void {
+  state.showToolOutput = false;
+  state.toolOutputsLoaded = false;
+  state.toolOutputsLoading = false;
+  state.showToolOutputAfterLoad = false;
+}
+
+/**
+ * Apply the daemon's historical tool-output availability for a freshly loaded
+ * conversation. Compact loads always start collapsed; full loads preserve the
+ * ability to expand immediately.
+ */
+export function setLoadedConversationToolOutputState(state: RenderState, included: boolean): void {
+  state.toolOutputsLoaded = included;
+  state.toolOutputsLoading = false;
+  state.showToolOutputAfterLoad = false;
+  if (!included) state.showToolOutput = false;
+}
+
+/**
+ * Apply updated historical tool-output availability for the current
+ * conversation without overriding the user's current expansion preference.
+ */
+export function setCurrentConversationToolOutputAvailability(state: RenderState, included: boolean): void {
+  state.toolOutputsLoaded = included;
+  state.toolOutputsLoading = false;
+}
+
+/** Semantic system-notice colors accepted by TUI call sites and daemon events. */
+export type SystemNoticeColorName = "muted" | "warning" | "error" | "success";
+
+/**
+ * Normalize a system-notice color into a concrete ANSI style.
+ *
+ * Accepts either a semantic color name (e.g. "warning") or an already-resolved
+ * theme escape sequence (e.g. theme.warning). Unknown strings are passed
+ * through unchanged so custom ANSI styles still work.
+ */
+export function resolveSystemMessageColor(color?: SystemNoticeColorName | string): string | undefined {
+  if (color === "error") return theme.error;
+  if (color === "warning") return theme.warning;
+  if (color === "muted") return theme.muted;
+  if (color === "success") return theme.success;
+  return color;
+}
+
+/**
+ * Add a user-invoked system notice to the UI.
+ *
+ * While an assistant response is actively streaming, these notices are kept in
+ * the live tail so command feedback stays visible at the bottom. Daemon-
+ * originated stream notices should bypass this helper and be inserted inline.
+ *
+ * The color may be either a semantic notice color name ("warning", "error",
+ * "muted", "success") or an already-resolved ANSI style string.
+ */
+export function pushSystemMessage(state: RenderState, text: string, color?: SystemNoticeColorName | string): void {
+  const msg: SystemMessage = { role: "system", text, color: resolveSystemMessageColor(color), metadata: null };
+  if (isStreaming(state)) {
+    state.streamingTailMessages.push(msg);
+  } else {
+    state.messages.push(msg);
+  }
+}
+
+export function renderFolderInstructionsDocument(state: RenderState, text: string): void {
+  const trimmed = text.trim();
+  state.messages = trimmed ? [{ role: "system_instructions", text: trimmed, metadata: null }] : [];
+  clearStreamingTailMessages(state);
+  state.scrollOffset = 0;
+  resetToolOutputState(state);
+}
+
+export function currentFolderEffectiveInstructions(state: RenderState): string {
+  const folderId = state.sidebar.currentFolderId;
+  if (!folderId) return "";
+  return state.sidebar.folders.find(folder => folder.id === folderId)?.effectiveInstructions ?? "";
+}
+
+export function renderCurrentFolderDraftInstructions(state: RenderState): void {
+  renderFolderInstructionsDocument(state, currentFolderEffectiveInstructions(state));
+}
+
+export function resetDraftConversationState(state: RenderState): void {
+  state.folderInstructionsDoc = null;
+  state.convId = null;
+  state.messages = [];
+  clearPendingAI(state);
+  clearStreamingTailMessages(state);
+  state.contextTokens = null;
+  state.goal = null;
+  state.voicePrompt = null;
+  state.voicePromptJobs = [];
+  state.voiceMessage = null;
+  resetToolOutputState(state);
+  resetNewConversationDefaults(state);
+  state.pendingSystemInstructions = null;
+  state.pendingGenerateTitleOnCreate = false;
+  state.pendingQueuedDraftConvId = null;
+  renderCurrentFolderDraftInstructions(state);
+}
+
+export function openFolderInstructionsDocument(state: RenderState, folderId: string): void {
+  state.folderInstructionsDoc = { folderId, text: "", savedText: "", loading: true };
+  state.sidebar.currentFolderId = folderId;
+  state.sidebar.selectedItem = { type: "folder_instructions", folderId };
+  state.sidebar.selectedId = null;
+  state.convId = null;
+  state.contextTokens = null;
+  state.goal = null;
+  state.voicePrompt = null;
+  state.voicePromptJobs = [];
+  state.voiceMessage = null;
+  clearPendingAI(state);
+  state.messages = [];
+  clearStreamingTailMessages(state);
+  state.scrollOffset = 0;
+  resetToolOutputState(state);
+}
+
+export function setFolderInstructionsDocumentText(state: RenderState, folderId: string, text: string): void {
+  if (!state.folderInstructionsDoc || state.folderInstructionsDoc.folderId !== folderId) return;
+  state.folderInstructionsDoc = { folderId, text, savedText: text, loading: false };
+  renderFolderInstructionsDocument(state, text);
+}
+
+export function getProviderInfo(state: RenderState, provider = state.provider): ProviderInfo | null {
+  return state.providerRegistry.find((candidate) => candidate.id === provider) ?? null;
+}
+
+export function getModelInfo(state: RenderState, provider = state.provider, model = state.model): ModelInfo | null {
+  return getProviderInfo(state, provider)?.models.find((candidate) => candidate.id === model) ?? null;
+}
+
+export function modelSupportsImages(state: RenderState, provider = state.provider, model = state.model): boolean {
+  return supportsImageInputsForModel(getModelInfo(state, provider, model));
+}
+
+/** Reset the pending-new-conversation settings to the configured app defaults. */
+export function resetNewConversationDefaults(state: RenderState): void {
+  const defaults = effectiveConversationDefaults();
+  state.provider = defaults.provider;
+  // Treat the configured default as the selected blank-chat provider so later
+  // provider-registry refreshes don't substitute the focused/sole auth provider.
+  state.hasChosenProvider = true;
+  state.model = defaults.model;
+  state.effort = defaults.effort;
+  state.fastMode = defaults.fastMode;
+}
+
+function defaultSelectionForPreferredProvider(provider: ProviderId | null): ConversationDefaults {
+  if (!provider) return productConversationDefaults();
+  const model = DEFAULT_MODEL_BY_PROVIDER[provider];
+  return {
+    provider,
+    model,
+    effort: defaultEffortForModelId(provider, model),
+    fastMode: false,
+  };
+}
+
+// ── Focus transition helpers ──────────────────────────────────────
+// Centralise the mode+focus combos that are repeated across call sites.
+
+/** Focus the prompt in insert mode. */
+export function focusPrompt(state: RenderState): void {
+  state.panelFocus = "chat";
+  state.chatFocus = "prompt";
+  if (state.vim.mode !== "insert") state.vim.mode = "insert";
+}
+
+/** Focus chat history in normal mode. */
+export function focusHistory(state: RenderState): void {
+  state.panelFocus = "chat";
+  state.chatFocus = "history";
+  state.vim.mode = "normal";
+}
+
+/** Focus the sidebar in normal mode. */
+export function focusSidebar(state: RenderState): void {
+  state.panelFocus = "sidebar";
+  state.vim.mode = "normal";
+}
+
+export function createInitialState(): RenderState {
+  const configuredDefaults = configuredConversationDefaults();
+  const preferredProvider = loadPreferredProvider();
+  const defaults = configuredDefaults ?? defaultSelectionForPreferredProvider(preferredProvider);
+  const provider = defaults.provider;
+  const hideSensitiveInfo = loadHideSensitiveInfoPreference();
+
+  const s: RenderState = {
+ 	    messages: [],
+    pendingAI: null,
+    pendingAIHydratedFromSnapshot: false,
+    suppressPendingAIMetadataStartedAt: null,
+	    provider,
+	    hasChosenProvider: configuredDefaults !== null || preferredProvider !== null,
+	    model: defaults.model,
+	    effort: defaults.effort,
+	    fastMode: defaults.fastMode,
+    goal: null,
+    convId: null,
+    inputBuffer: "",
+    cursorPos: 0,
+    promptCurswant: null,
+    cols: process.stdout.columns || 80,
+    rows: process.stdout.rows || 24,
+    scrollOffset: 0,
+    authByProvider: {
+      openai: false,
+      deepseek: false,
+    },
+    authInfoByProvider: {
+      openai: createEmptyProviderAuthInfo(),
+      deepseek: createEmptyProviderAuthInfo(),
+    },
+    usageByProvider: {
+      openai: null,
+      deepseek: null,
+    },
+    tokenStats: null,
+    contextTokens: null,
+    panelFocus: "chat",
+    chatFocus: "prompt",
+    sidebar: createSidebarState(),
+    vim: createVimState(),
+    layout: { totalLines: 0, messageAreaHeight: 0, chatCol: 1, sepAbove: 0, firstInputRow: 0, sepBelow: 0 },
+    deferredHistoryRender: null,
+    pendingSend: { active: false, text: "" },
+    pendingAuthQueue: [],
+    pendingSystemInstructions: null,
+    pendingGenerateTitleOnCreate: false,
+    pendingQueuedDraftConvId: null,
+    streamingTailMessages: [],
+    pendingAICommittedIndex: null,
+    lastStreamSeqByConv: {},
+    toolRegistry: [],
+    providerRegistry: [],
+	    externalToolStyles: [],
+	    showToolOutput: false,
+	    hideSensitiveInfo,
+	    toolOutputsLoaded: false,
+    toolOutputsLoading: false,
+    showToolOutputAfterLoad: false,
+    historyCursor: createHistoryCursor(),
+    historyCurswant: null,
+    historyVisualAnchor: createHistoryCursor(),
+    historyLines: [],
+    historyWrapContinuation: [],
+    historyWrapJoiners: [],
+    historyCopyLines: [],
+    historyMessageBounds: [],
+    historyLineAnchors: [],
+    undo: createUndoState(),
+    autocomplete: null,
+    promptScrollOffset: 0,
+    queuePrompt: null,
+    search: null,
+    queuedMessages: [],
+    editMessagePrompt: null,
+    pendingImages: [],
+    voicePrompt: null,
+    voicePromptJobs: [],
+    voiceMessage: null,
+    folderInstructionsDoc: null,
+    mouseCursor: "pointer",
+  };
+  // App starts in insert mode — mark entry so first Esc commits the session
+  markInsertEntry(s.undo, s.inputBuffer, s.cursorPos);
+  return s;
+}

@@ -1,0 +1,51 @@
+{
+  "theme": "whale",
+  "features": {
+    "computerUse": false,
+    "goalTool": true
+  },
+  "agent": {
+    "workingDirectory": ".exocortex-cwd"
+  },
+  "ping": {
+    "mode": null,
+    "sound": null
+  },
+  "transcription": {
+    "backend": "whisper-local",
+    "whisperLocal": {
+      "url": "http://127.0.0.1:8910"
+    }
+  },
+  "providers": {
+    "openai": {
+      "retryOnUsageLimitReset": false
+    },
+    "deepseek": {
+      "baseUrl": "https://api.deepseek.com"
+    }
+  },
+  "safety": {
+    "enabled": true,
+    "bash": [],
+    "read": [],
+    "write": [],
+    "edit": [],
+    "grep": [],
+    "glob": [],
+    "browse": [],
+    "computer_list_apps": [],
+    "computer_get_app_state": [],
+    "computer_click": [],
+    "computer_drag": [],
+    "computer_type_text": [],
+    "computer_press_key": [],
+    "computer_scroll": [],
+    "computer_set_value": [],
+    "computer_perform_secondary_action": []
+  },
+  "openers": {
+    "url": null,
+    "rules": []
+  }
+}
